@@ -1,0 +1,6 @@
+{
+  "name": "QuizBlast - Real-time Multiplayer Quiz Platform",
+  "description": "Real-time multiplayer Kahoot-style quiz platform with live host screen, mobile player buzzers, AI quiz generator, and animated podium.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
