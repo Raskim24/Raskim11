@@ -83,20 +83,13 @@ export default function App() {
   const checkAuthAndLoadQuizzes = async () => {
     try {
       const me = await api.getMe();
-      if (me) {
-        setUser(me);
-        loadQuizzes();
-      } else {
-        // Auto login demo host so applet works immediately out of the box
-        const demoUser = await api.login('host@quizblast.io', 'Password123').catch(() => null);
-        if (demoUser) {
-          setUser(demoUser);
-          loadQuizzes();
-        }
-      }
-    } catch {
-      // Fallback
-      loadQuizzes();
+      setUser(me);
+      if (me) await loadQuizzes();
+      else setQuizzes([]);
+    } catch (err) {
+      console.error('Failed to restore the signed-in session:', err);
+      setUser(null);
+      setQuizzes([]);
     }
   };
 
@@ -109,16 +102,25 @@ export default function App() {
     }
   };
 
-  const handleLogout = () => {
-    api.clearAuth();
+  const handleLogout = async () => {
+    try {
+      await api.logout();
+    } catch (err) {
+      console.error('Failed to revoke the signed-in session:', err);
+    }
     setUser(null);
+    setQuizzes([]);
     setActivePin('');
     setLiveGameState(null);
     setCurrentView('dashboard');
   };
 
   const handleHostGame = (quizId: string) => {
-    const token = api.getToken() || 'demo';
+    const token = api.getToken();
+    if (!user || !token) {
+      setIsAuthModalOpen(true);
+      return;
+    }
     socket.emit('host:create_game', { quizId, token });
   };
 
@@ -128,6 +130,10 @@ export default function App() {
   };
 
   const handleNewQuiz = () => {
+    if (!user) {
+      setIsAuthModalOpen(true);
+      return;
+    }
     setEditingQuiz(null);
     setCurrentView('editor');
   };

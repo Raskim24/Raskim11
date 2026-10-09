@@ -35,7 +35,7 @@ QuizBlast is a full-stack, real-time multiplayer quiz game where hosts project q
 ## 🚀 Quick Start Guide (Local Setup)
 
 ### 1. Prerequisites
-- Node.js (version 18 or 20+)
+- Node.js 22 or newer
 - npm or yarn
 
 ### 2. Installation
@@ -60,6 +60,8 @@ Add your `GEMINI_API_KEY` (from Google AI Studio) if you wish to use the AI Quiz
 npm run dev
 ```
 Open [http://localhost:3000](http://localhost:3000) in your browser.
+
+Create an account from **Host Login → Sign Up**. Accounts and quizzes are stored in the local SQLite database at `.data/quizblast.sqlite`; the app creates this file automatically and it remains on the machine across server restarts. Keep `.data/` out of source control. For hosted deployments, configure a persistent database or disk before using real accounts and quizzes; an ephemeral server filesystem does not preserve this data.
 
 - To test on your mobile phone on the same Wi-Fi: open `http://<YOUR_LOCAL_IP>:3000` on your phone!
 - Or use the built-in **"Simulate Phone"** button right on the host screen to test side-by-side in one window!

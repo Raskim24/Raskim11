@@ -3,10 +3,12 @@ import http from 'http';
 import { Server, Socket } from 'socket.io';
 import path from 'path';
 import fs from 'fs';
+import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import JSZip from 'jszip';
 import { GoogleGenAI } from '@google/genai';
 import { INITIAL_SEED_QUIZZES } from './src/data/seedQuizzes';
 import { LiveGameState, Player, Question, Quiz, GameHistoryItem } from './src/types/quiz';
+import { storage, StoredUser } from './server/storage';
 
 const app = express();
 const server = http.createServer(app);
@@ -21,53 +23,8 @@ const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
 
-// In-Memory Database Store (isolated per owner_id)
-interface UserRecord {
-  id: string;
-  email: string;
-  password: string; // hashed or demo salt
-  display_name: string;
-  created_at: string;
-}
-
-const users: Map<string, UserRecord> = new Map();
-// Seed a default host user for instant test if desired
-const DEFAULT_USER_ID = 'host-demo-123';
-users.set(DEFAULT_USER_ID, {
-  id: DEFAULT_USER_ID,
-  email: 'host@quizblast.io',
-  password: 'Password123',
-  display_name: 'Professor Blast',
-  created_at: new Date().toISOString(),
-});
-
-// Quizzes store
-const quizzesStore: Map<string, Quiz> = new Map();
-INITIAL_SEED_QUIZZES.forEach((q) => {
-  quizzesStore.set(q.id, { ...q, owner_id: DEFAULT_USER_ID });
-});
-
 // Game history store
 const gameHistoryStore: Map<string, GameHistoryItem[]> = new Map();
-gameHistoryStore.set(DEFAULT_USER_ID, [
-  {
-    id: 'hist-1',
-    pin: '748291',
-    quizId: 'seed-quiz-space-science',
-    quizTitle: 'Cosmic Wonders: Space & Science Challenge',
-    date: new Date(Date.now() - 86400000).toISOString(),
-    playerCount: 12,
-    totalQuestions: 5,
-    winner: { nickname: 'AstroNova', score: 4850 },
-    rankings: [
-      { rank: 1, nickname: 'AstroNova', score: 4850, correctCount: 5 },
-      { rank: 2, nickname: 'StarGazer', score: 4120, correctCount: 4 },
-      { rank: 3, nickname: 'CosmoKid', score: 3890, correctCount: 4 },
-      { rank: 4, nickname: 'PixelPilot', score: 2950, correctCount: 3 },
-      { rank: 5, nickname: 'Nebula', score: 2100, correctCount: 2 },
-    ],
-  },
-]);
 
 // Active live games on the server
 interface ServerLiveGame {
@@ -89,21 +46,44 @@ interface ServerLiveGame {
 
 const activeGames: Map<string, ServerLiveGame> = new Map();
 
-// Helper: Token extraction (simple secure bearer token simulation)
-function getUserIdFromAuthHeader(req: express.Request): string | null {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return null;
-  const token = authHeader.replace(/^Bearer\s+/, '');
+function hashToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+function getUserIdForToken(token: string | undefined): string | null {
   if (!token) return null;
-  // If token is in users or match session
-  if (users.has(token)) return token;
-  // Look up by id
-  for (const [id, user] of users.entries()) {
-    if (token === `token-${id}` || token === id) {
-      return id;
-    }
-  }
-  return DEFAULT_USER_ID;
+  return storage.getSessionUserId(hashToken(token), new Date().toISOString()) || null;
+}
+
+function getUserIdFromAuthHeader(req: express.Request): string | null {
+  const match = req.headers.authorization?.match(/^Bearer\s+(.+)$/i);
+  return getUserIdForToken(match?.[1]);
+}
+
+function issueSession(userId: string): string {
+  const token = randomBytes(32).toString('base64url');
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  storage.createSession(hashToken(token), userId, expiresAt);
+  return token;
+}
+
+function hashPassword(password: string, salt = randomBytes(16).toString('hex')): { hash: string; salt: string } {
+  return { hash: scryptSync(password, salt, 64).toString('hex'), salt };
+}
+
+function verifyPassword(password: string, user: StoredUser): boolean {
+  const expected = Buffer.from(user.password_hash, 'hex');
+  const actual = scryptSync(password, user.password_salt, expected.length);
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+function toPublicUser(user: StoredUser) {
+  return {
+    id: user.id,
+    email: user.email,
+    display_name: user.display_name,
+    created_at: user.created_at,
+  };
 }
 
 // Rate limiter map for auth endpoints
@@ -132,46 +112,52 @@ app.post('/api/auth/signup', (req, res) => {
   }
 
   const { display_name, email, password, confirm_password } = req.body;
-  if (!email || !password || !display_name) {
+  if (
+    typeof email !== 'string' ||
+    typeof password !== 'string' ||
+    typeof display_name !== 'string' ||
+    typeof confirm_password !== 'string'
+  ) {
     return res.status(400).json({ error: 'All fields are required.' });
+  }
+  const normalizedEmail = email.trim().toLowerCase();
+  const normalizedName = display_name.trim();
+  if (!normalizedName || normalizedName.length > 80 || normalizedEmail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    return res.status(400).json({ error: 'Enter a valid email and display name.' });
   }
   if (password !== confirm_password) {
     return res.status(400).json({ error: 'Passwords do not match.' });
   }
-  if (password.length < 8 || !/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)) {
+  if (password.length < 8 || password.length > 128 || !/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)) {
     return res.status(400).json({ error: 'Password must be at least 8 characters with at least one letter and one number.' });
   }
 
-  // Check existing
-  for (const user of users.values()) {
-    if (user.email.toLowerCase() === email.toLowerCase().trim()) {
-      return res.status(400).json({ error: 'This email already has an account. Try logging in.' });
-    }
+  const newId = randomUUID();
+  const createdAt = new Date().toISOString();
+  const credential = hashPassword(password);
+  const newUser: StoredUser = {
+    id: newId,
+    email: normalizedEmail,
+    password_hash: credential.hash,
+    password_salt: credential.salt,
+    display_name: normalizedName,
+    created_at: createdAt,
+  };
+  const starterQuizzes = INITIAL_SEED_QUIZZES.map((quiz) => ({
+    ...JSON.parse(JSON.stringify(quiz)) as Quiz,
+    id: randomUUID(),
+    owner_id: newId,
+    created_at: createdAt,
+    updated_at: createdAt,
+  }));
+
+  if (!storage.createAccount(newUser, starterQuizzes)) {
+    return res.status(400).json({ error: 'This email already has an account. Try logging in.' });
   }
 
-  const newId = `user-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-  const newUser: UserRecord = {
-    id: newId,
-    email: email.trim().toLowerCase(),
-    password,
-    display_name: display_name.trim(),
-    created_at: new Date().toISOString(),
-  };
-  users.set(newId, newUser);
-
-  // Copy seed quizzes to new user so they have rich starter quizzes
-  INITIAL_SEED_QUIZZES.forEach((sq) => {
-    const clonedId = `quiz-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-    quizzesStore.set(clonedId, {
-      ...sq,
-      id: clonedId,
-      owner_id: newId,
-    });
-  });
-
   return res.json({
-    token: `token-${newId}`,
-    user: { id: newUser.id, email: newUser.email, display_name: newUser.display_name, created_at: newUser.created_at },
+    token: issueSession(newId),
+    user: toPublicUser(newUser),
   });
 });
 
@@ -183,38 +169,35 @@ app.post('/api/auth/login', (req, res) => {
   }
 
   const { email, password } = req.body;
-  if (!email || !password) {
+  if (typeof email !== 'string' || typeof password !== 'string' || password.length > 128) {
     return res.status(400).json({ error: 'Email or password is wrong.' });
   }
 
-  let matchedUser: UserRecord | null = null;
-  for (const user of users.values()) {
-    if (user.email.toLowerCase() === email.toLowerCase().trim() && user.password === password) {
-      matchedUser = user;
-      break;
-    }
-  }
-
-  if (!matchedUser) {
+  const matchedUser = storage.getUserByEmail(email.trim().toLowerCase());
+  if (!matchedUser || !verifyPassword(password, matchedUser)) {
     return res.status(401).json({ error: 'Email or password is wrong.' });
   }
 
   return res.json({
-    token: `token-${matchedUser.id}`,
-    user: { id: matchedUser.id, email: matchedUser.email, display_name: matchedUser.display_name, created_at: matchedUser.created_at },
+    token: issueSession(matchedUser.id),
+    user: toPublicUser(matchedUser),
   });
 });
 
 // Auth: Me
 app.get('/api/auth/me', (req, res) => {
   const userId = getUserIdFromAuthHeader(req);
-  if (!userId || !users.has(userId)) {
+  const user = userId ? storage.getUserById(userId) : undefined;
+  if (!user) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  const user = users.get(userId)!;
-  return res.json({
-    user: { id: user.id, email: user.email, display_name: user.display_name, created_at: user.created_at },
-  });
+  return res.json({ user: toPublicUser(user) });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  const match = req.headers.authorization?.match(/^Bearer\s+(.+)$/i);
+  if (match?.[1]) storage.deleteSession(hashToken(match[1]));
+  return res.json({ success: true });
 });
 
 // Auth: Forgot Password
@@ -230,43 +213,43 @@ app.post('/api/auth/reset-password', (_req, res) => {
 // Auth: Update Settings
 app.post('/api/auth/update-profile', (req, res) => {
   const userId = getUserIdFromAuthHeader(req);
-  if (!userId || !users.has(userId)) return res.status(401).json({ error: 'Unauthorized' });
-  const user = users.get(userId)!;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+  const user = storage.getUserById(userId);
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
   const { display_name } = req.body;
-  if (display_name) {
-    user.display_name = display_name.trim();
+  if (typeof display_name === 'string' && display_name.trim()) {
+    user.display_name = display_name.trim().slice(0, 80);
+    storage.updateProfile(userId, user.display_name);
   }
-  return res.json({ success: true, user: { id: user.id, email: user.email, display_name: user.display_name, created_at: user.created_at } });
+  return res.json({ success: true, user: toPublicUser(user) });
 });
 
 app.post('/api/auth/update-password', (req, res) => {
   const userId = getUserIdFromAuthHeader(req);
-  if (!userId || !users.has(userId)) return res.status(401).json({ error: 'Unauthorized' });
-  const user = users.get(userId)!;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+  const user = storage.getUserById(userId);
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
   const { current_password, new_password } = req.body;
-  if (user.password !== current_password) {
+  if (typeof current_password !== 'string' || !verifyPassword(current_password, user)) {
     return res.status(400).json({ error: 'Current password is incorrect.' });
   }
-  if (!new_password || new_password.length < 8 || !/[a-zA-Z]/.test(new_password) || !/[0-9]/.test(new_password)) {
+  if (typeof new_password !== 'string' || new_password.length < 8 || new_password.length > 128 || !/[a-zA-Z]/.test(new_password) || !/[0-9]/.test(new_password)) {
     return res.status(400).json({ error: 'New password must be at least 8 characters with at least one letter and one number.' });
   }
-  user.password = new_password;
+  const credential = hashPassword(new_password);
+  storage.updatePassword(userId, credential.hash, credential.salt);
   return res.json({ success: true, message: 'Password updated successfully' });
 });
 
 app.post('/api/auth/delete-account', (req, res) => {
   const userId = getUserIdFromAuthHeader(req);
-  if (!userId || !users.has(userId)) return res.status(401).json({ error: 'Unauthorized' });
+  if (!userId || !storage.getUserById(userId)) return res.status(401).json({ error: 'Unauthorized' });
   const { confirmation } = req.body;
   if (confirmation !== 'DELETE') {
     return res.status(400).json({ error: 'Must type DELETE to confirm.' });
   }
-  // Delete user's quizzes and history
-  for (const [qId, q] of quizzesStore.entries()) {
-    if (q.owner_id === userId) quizzesStore.delete(qId);
-  }
+  storage.deleteUser(userId);
   gameHistoryStore.delete(userId);
-  users.delete(userId);
   return res.json({ success: true });
 });
 
@@ -274,15 +257,14 @@ app.post('/api/auth/delete-account', (req, res) => {
 app.get('/api/quizzes', (req, res) => {
   const userId = getUserIdFromAuthHeader(req);
   if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-  const list = Array.from(quizzesStore.values()).filter((q) => q.owner_id === userId);
-  return res.json(list);
+  return res.json(storage.listQuizzes(userId));
 });
 
 // Quizzes: Get single quiz
 app.get('/api/quizzes/:id', (req, res) => {
   const userId = getUserIdFromAuthHeader(req);
   if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-  const quiz = quizzesStore.get(req.params.id);
+  const quiz = storage.getQuiz(req.params.id);
   if (!quiz || quiz.owner_id !== userId) {
     return res.status(404).json({ error: 'Quiz not found' });
   }
@@ -294,10 +276,10 @@ app.post('/api/quizzes', (req, res) => {
   const userId = getUserIdFromAuthHeader(req);
   if (!userId) return res.status(401).json({ error: 'Unauthorized' });
   const { title, description, coverImage, questions } = req.body;
-  if (!title) return res.status(400).json({ error: 'Title is required' });
+  if (typeof title !== 'string' || !title.trim()) return res.status(400).json({ error: 'Title is required' });
 
   const newQuiz: Quiz = {
-    id: `quiz-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    id: randomUUID(),
     owner_id: userId,
     title: title.trim(),
     description: description || '',
@@ -307,7 +289,7 @@ app.post('/api/quizzes', (req, res) => {
     updated_at: new Date().toISOString(),
   };
 
-  quizzesStore.set(newQuiz.id, newQuiz);
+  storage.saveQuiz(newQuiz);
   return res.json(newQuiz);
 });
 
@@ -315,7 +297,7 @@ app.post('/api/quizzes', (req, res) => {
 app.put('/api/quizzes/:id', (req, res) => {
   const userId = getUserIdFromAuthHeader(req);
   if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-  const quiz = quizzesStore.get(req.params.id);
+  const quiz = storage.getQuiz(req.params.id);
   if (!quiz || quiz.owner_id !== userId) {
     return res.status(404).json({ error: 'Quiz not found' });
   }
@@ -329,7 +311,7 @@ app.put('/api/quizzes/:id', (req, res) => {
   }
   quiz.updated_at = new Date().toISOString();
 
-  quizzesStore.set(quiz.id, quiz);
+  storage.saveQuiz(quiz);
   return res.json(quiz);
 });
 
@@ -337,21 +319,21 @@ app.put('/api/quizzes/:id', (req, res) => {
 app.post('/api/quizzes/:id/duplicate', (req, res) => {
   const userId = getUserIdFromAuthHeader(req);
   if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-  const quiz = quizzesStore.get(req.params.id);
+  const quiz = storage.getQuiz(req.params.id);
   if (!quiz || quiz.owner_id !== userId) {
     return res.status(404).json({ error: 'Quiz not found' });
   }
 
   const duplicate: Quiz = {
     ...JSON.parse(JSON.stringify(quiz)),
-    id: `quiz-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    id: randomUUID(),
     owner_id: userId,
     title: `${quiz.title} (Copy)`,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
 
-  quizzesStore.set(duplicate.id, duplicate);
+  storage.saveQuiz(duplicate);
   return res.json(duplicate);
 });
 
@@ -359,11 +341,11 @@ app.post('/api/quizzes/:id/duplicate', (req, res) => {
 app.delete('/api/quizzes/:id', (req, res) => {
   const userId = getUserIdFromAuthHeader(req);
   if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-  const quiz = quizzesStore.get(req.params.id);
+  const quiz = storage.getQuiz(req.params.id);
   if (!quiz || quiz.owner_id !== userId) {
     return res.status(404).json({ error: 'Quiz not found' });
   }
-  quizzesStore.delete(req.params.id);
+  storage.deleteQuiz(req.params.id);
   return res.json({ success: true });
 });
 
@@ -594,9 +576,13 @@ function endCurrentQuestion(game: ServerLiveGame) {
 io.on('connection', (socket: Socket) => {
   // Host creates game
   socket.on('host:create_game', ({ quizId, token }: { quizId: string; token: string }) => {
-    const userId = token ? token.replace(/^token-/, '') : DEFAULT_USER_ID;
-    const quiz = quizzesStore.get(quizId) || Array.from(quizzesStore.values())[0];
-    if (!quiz) {
+    const userId = getUserIdForToken(token);
+    if (!userId) {
+      socket.emit('error', { message: 'Please log in before hosting a game.' });
+      return;
+    }
+    const quiz = storage.getQuiz(quizId);
+    if (!quiz || quiz.owner_id !== userId) {
       socket.emit('error', { message: 'Quiz not found' });
       return;
     }

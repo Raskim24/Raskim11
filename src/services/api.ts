@@ -83,6 +83,14 @@ export const api = {
     return data.user;
   },
 
+  async logout(): Promise<void> {
+    try {
+      await this.request<{ success: boolean }>('/api/auth/logout', { method: 'POST' });
+    } finally {
+      this.clearAuth();
+    }
+  },
+
   async getMe(): Promise<AuthUser | null> {
     try {
       const data = await this.request<{ user: AuthUser }>('/api/auth/me');

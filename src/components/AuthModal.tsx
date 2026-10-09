@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { X, Eye, EyeOff, Lock, Mail, UserCheck, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { X, Eye, EyeOff, Lock, Mail, AlertCircle, CheckCircle2 } from 'lucide-react';
 import { api, AuthUser } from '../services/api';
 
 interface AuthModalProps {
@@ -119,27 +119,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       } finally {
         setLoading(false);
       }
-    }
-  };
-
-  const handleDemoLogin = async () => {
-    setLoading(true);
-    setGeneralError('');
-    try {
-      const user = await api.login('host@quizblast.io', 'Password123');
-      onAuthSuccess(user);
-      onClose();
-    } catch {
-      // fallback
-      try {
-        const user = await api.signup('Professor Blast', 'host@quizblast.io', 'Password123', 'Password123');
-        onAuthSuccess(user);
-        onClose();
-      } catch (e: unknown) {
-        setGeneralError(e instanceof Error ? e.message : 'Demo login error');
-      }
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -318,17 +297,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           </button>
         </form>
 
-        {mode === 'login' && (
-          <div className="mt-4 pt-4 border-t border-slate-800 text-center">
-            <button
-              onClick={handleDemoLogin}
-              type="button"
-              className="text-xs font-semibold text-amber-400 hover:text-amber-300 bg-amber-400/10 hover:bg-amber-400/20 px-3 py-1.5 rounded-lg border border-amber-400/30 transition-colors"
-            >
-              ⚡ Quick Demo Host Login (Professor Blast)
-            </button>
-          </div>
-        )}
       </div>
     </div>
   );
